@@ -13,19 +13,22 @@ LibsqlError: SERVER_ERROR: Server returned HTTP status 404
 
 ## TL;DR
 
-`repro.mjs` creates fresh databases and, for each, samples **both planes against one clock**:
+`repro.mjs` creates fresh databases and, for each, samples **both planes against one clock** — and queries
+the data plane both at *control-exists* and **after the `POST` has returned 200 to the caller** (`data@post-ack`):
 
 ```
-baseline: data-plane query to a NEVER-created db → 404  (identical to the create→serve 404)
+baseline: data-plane query to a NEVER-created db → 404  (same HTTP 404 as the create→serve case)
 
-# 1 reprotest-cd7d1c04: POST-ack@456ms | control "exists"@75ms  → data query NOW=404 | data serves@2597ms | gap=2522ms  ← create→serve 404
-# 2 reprotest-21600704: POST-ack@329ms | control "exists"@124ms → data query NOW=404 | data serves@2490ms | gap=2366ms  ← create→serve 404
-# 3 reprotest-79cdd72b: POST-ack@292ms | control "exists"@125ms → data query NOW=404 | data serves@2504ms | gap=2379ms  ← create→serve 404
+# 1 reprotest-a483aa0d: POST-ack@465ms | control "exists"@144ms → data@control=404 | data@post-ack=404 | data serves@2504ms | gap=2360ms  ← create→serve 404
+# 2 reprotest-ec2257b2: POST-ack@399ms | control "exists"@124ms → data@control=404 | data@post-ack=404 | data serves@2458ms | gap=2334ms  ← create→serve 404
+# 4 reprotest-f2b422cc: POST-ack@326ms | control "exists"@226ms → data@control=404 | data@post-ack=404 | data serves@2447ms | gap=2221ms  ← create→serve 404
 ...
-RESULT: 6/6 reproduced the create→serve 404 (control plane said "exists" AND the data plane returned 404); 0 served immediately.
+RESULT: 6/6 reproduced the create→serve 404 (data plane 404'd at control-exists and/or after POST-ack, AND the db later served); served-immediately=0; inconclusive=0.
+gap (control "exists" → data serves): min=2189ms median=2342ms max=2360ms
 ```
 
-Reproduces **6/6 – 10/10** every run.
+Reproduces **6/6 – 10/10** every run. A reproduction is counted **only** when the data plane 404s **and the
+same database later serves** — so wrong credentials or permanent unavailability can't be a false positive.
 
 ## Run it
 
@@ -48,17 +51,22 @@ Two planes, sampled on the same clock from `t0` (just before `POST /v1/organizat
 
 | signal | when |
 |---|---|
-| control plane `GET /databases/{name}` first returns `200` ("exists") | **~75–130ms** |
-| `POST /databases` returns to the caller (the create is ACKed) | ~260–460ms |
-| a data-plane `SELECT 1` issued **at the instant the control plane said "exists"** | **`404`** |
+| control plane `GET /databases/{name}` first returns `200` ("exists") | **~75–230ms** |
+| `POST /databases` returns `200` to the caller (the create is ACKed) | ~260–470ms |
+| a data-plane `SELECT 1` issued **at the instant the control plane said "exists"** (`data@control`) | **`404`** |
+| a data-plane `SELECT 1` issued **after the `POST` returned `200` to the caller** (`data@post-ack`) | **`404`** |
 | the data-plane endpoint first actually serves | **~2.4–2.6s** |
-| **gap (control "exists" → data serves)** | **~2.3–2.5s** |
+| **gap (control "exists" → data serves)** | **~2.2–2.5s** |
 
-The data-plane query happens **after** the control plane has confirmed the database exists — i.e. after
-Turso has durably registered the create. So this is **not** a client reading before its write landed: the
-write demonstrably landed (the control plane is an independent witness), yet the **same hostname, same
-credentials** 404s for ~2.5s and then serves with no change on the caller's side. That is a control→data
-propagation/serve gap **inside Turso**.
+This is **not** a client reading before its write landed, and the harness proves it two ways:
+
+1. The `data@control` query runs **after** the control plane confirmed the database exists — Turso has
+   durably registered the create (the control plane is an independent witness), yet the data plane 404s.
+2. The `data@post-ack` query runs **after `POST /databases` returned `200` to the caller** — the write call
+   has demonstrably completed for the client — and it **still** 404s for ~2s more.
+
+In both cases the **same hostname, same credentials** 404s and then serves with no change on the caller's
+side, so this is a control→data propagation/serve gap **inside Turso**, not a read-before-write.
 
 The `baseline` line proves the second half of the problem: a query to a database that was never created
 returns the **identical** 404, so the error on its own cannot tell "not ready yet" from "doesn't exist".
