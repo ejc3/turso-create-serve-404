@@ -1,0 +1,13 @@
+{
+  "name": "turso-create-serve-404",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal reproduction of the Turso Cloud create→serve 404 race",
+  "scripts": {
+    "repro": "node repro.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.17.3"
+  }
+}
